@@ -31,7 +31,7 @@ func (d *IntakeDispatcher) OnTargetArrived(t *Target, now float64) bool {
 		return true
 	}
 	// Д10О5: отказ вновь пришедшей заявке.
-	d.stats.Refused++
+	d.stats.AddRefused(t.SectorID())
 	return false
 }
 
