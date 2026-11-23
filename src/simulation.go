@@ -7,21 +7,22 @@ import (
 
 // Simulation — ядро метода особых состояний.
 type Simulation struct {
-	cfg        Config
-	now        float64
-	calendar   *Calendar
-	sources    []*TargetGenerator
-	devices    []*ComputingModule
-	zone       *TrackingZone
-	intake     *IntakeDispatcher
-	selection  *SelectionDispatcher
-	stats      *Statistics
-	nextID     int
-	stopReason string
+	cfg          Config
+	now          float64
+	calendar     *Calendar
+	sources      []*TargetGenerator
+	devices      []*ComputingModule
+	zone         *TrackingZone
+	intake       *IntakeDispatcher
+	selection    *SelectionDispatcher
+	stats        *Statistics
+	nextID       int
+	stopReason   string
+	requestLimit int
 }
 
 func NewSimulation(cfg Config) *Simulation {
-	stats := &Statistics{}
+	stats := NewStatistics(cfg.SourceCount, cfg.DeviceCount)
 	zone := NewTrackingZone(cfg.BufferCapacity)
 
 	s := &Simulation{
@@ -73,10 +74,27 @@ func NewSimulation(cfg Config) *Simulation {
 	return s
 }
 
-func (s *Simulation) Run() {
+func (s *Simulation) Run(mode RunMode) {
+	if mode == ModeAuto {
+		s.requestLimit = s.cfg.AutoLimit
+		s.runAuto()
+	} else {
+		s.requestLimit = s.cfg.StepLimit
+		s.runStep()
+	}
+
+	s.finalizeStats()
+	if mode == ModeAuto {
+		printAutoReport(s)
+		return
+	}
+	printSummary(s.stats, len(s.devices))
+}
+
+func (s *Simulation) runStep() {
 	step := 0
 	for s.calendar.Len() > 0 {
-		if s.stats.Generated >= s.cfg.StepLimit {
+		if s.stats.Generated >= s.requestLimit {
 			s.stopReason = "limit"
 			break
 		}
@@ -100,15 +118,54 @@ func (s *Simulation) Run() {
 
 		printStep(step, s.now, description, s)
 
-		if s.stats.Generated >= s.cfg.StepLimit {
+		if s.stats.Generated >= s.requestLimit {
 			s.stopReason = "limit"
 			break
 		}
 		waitNextStep()
 	}
+}
 
-	s.finalizeStats()
-	printSummary(s.stats, len(s.devices))
+// runAuto гоняет модель без пауз. После лимита новые цели не генерируются,
+// уже принятые дообслуживаются — иначе сводка обрезается на полуслове.
+func (s *Simulation) runAuto() {
+	for s.calendar.Len() > 0 {
+		if s.stats.Generated >= s.requestLimit && !s.hasUnfinished() {
+			s.stopReason = "drained"
+			break
+		}
+
+		ev := s.calendar.Pop()
+		if ev == nil {
+			break
+		}
+		if s.stats.Generated >= s.requestLimit && ev.Type == EventTargetArrived {
+			continue
+		}
+
+		s.now = ev.Time
+		switch ev.Type {
+		case EventTargetArrived:
+			s.handleArrival(ev)
+		case EventDeviceFreed:
+			s.handleDeviceFreed(ev)
+		}
+	}
+}
+
+func (s *Simulation) hasUnfinished() bool {
+	if s.zone.Size() > 0 {
+		return true
+	}
+	if batch := s.selection.Batch(); batch != nil && !batch.IsEmpty() {
+		return true
+	}
+	for _, d := range s.devices {
+		if d.IsBusy() {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Simulation) handleArrival(ev *Event) string {
@@ -118,16 +175,18 @@ func (s *Simulation) handleArrival(ev *Event) string {
 	}
 
 	target := src.Generate(s.now)
-	s.stats.Generated++
+	s.stats.AddGenerated(src.SectorID())
 
 	accepted := s.intake.OnTargetArrived(target, s.now)
 
-	// Планируем следующее прибытие от этого сектора.
-	s.calendar.Push(&Event{
-		Time:     src.NextArrivalTime(),
-		Type:     EventTargetArrived,
-		SourceID: src.SectorID(),
-	})
+	// Следующее прибытие — только пока не выбран лимит заявок.
+	if s.stats.Generated < s.requestLimit {
+		s.calendar.Push(&Event{
+			Time:     src.NextArrivalTime(),
+			Type:     EventTargetArrived,
+			SourceID: src.SectorID(),
+		})
+	}
 
 	if accepted {
 		return fmt.Sprintf("Цель %d от Сектора %d прилетела.", target.ID(), target.SectorID())
@@ -144,8 +203,7 @@ func (s *Simulation) handleDeviceFreed(ev *Event) string {
 	finished := device.Finish(s.now)
 	desc := fmt.Sprintf("Прибор П%d освободился.", device.ID())
 	if finished != nil {
-		s.stats.Served++
-		s.stats.TotalWait += finished.WaitTime()
+		s.stats.AddServed(finished, device.ID())
 		desc = fmt.Sprintf("Прибор П%d освободился (обслужена Цель %d).", device.ID(), finished.ID())
 	}
 
@@ -164,11 +222,13 @@ func (s *Simulation) finalizeStats() {
 	s.stats.TotalTime = s.now
 	var busy float64
 	for _, d := range s.devices {
-		busy += d.BusyTime()
+		b := d.BusyTime()
 		// Учитываем текущую незавершённую занятость на момент остановки.
 		if d.IsBusy() && d.Current() != nil {
-			busy += s.now - d.Current().serviceStart
+			b += s.now - d.Current().serviceStart
 		}
+		s.stats.Devices[d.ID()-1].BusyTime = b
+		busy += b
 	}
 	s.stats.TotalBusy = busy
 }
