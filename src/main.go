@@ -27,10 +27,10 @@ func main() {
 	cfg := Config{
 		SourceCount:    3,
 		Lambdas:        []float64{0.5, 0.3, 0.1},
-		DeviceCount:    6,
+		DeviceCount:    10,
 		MinService:     3.0,
 		MaxService:     10.0,
-		BufferCapacity: 4,
+		BufferCapacity: 15,
 		StepLimit:      20,
 		AutoLimit:      10000,
 		Seed:           42,
